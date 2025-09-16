@@ -137,6 +137,51 @@ def _fmt_dur(sec: float) -> str:
     if h: return f"{h}h {m}m {s}s"
     if m: return f"{m}m {s}s"
     return f"{s}s"
+
+# ---- algo detection helpers ----
+def _algo_from(d: dict) -> str | None:
+    """
+    Look for common fields where Talos may surface the algo name.
+    Returns normalized label like 'TWAP'/'VWAP'/'POV'/'ICEBERG' if detected.
+    """
+    keys = ("Strategy", "StrategyName", "Algo", "AlgoType", "Algorithm", "ExecutionStrategy", "OrderType")
+    candidates = ("TWAP", "VWAP", "POV", "ICEBERG", "ICE-BERG", "SNIPER", "PEG", "PEGGED")
+    for k in keys:
+        v = d.get(k)
+        if not v:
+            continue
+        s = str(v).strip()
+        su = s.upper()
+        for c in candidates:
+            if c in su:
+                # prefer canonical forms
+                canon = "ICEBERG" if "ICE" in c else c
+                return canon
+    return None
+
+def _is_child_order(d: dict) -> bool:
+    """Heuristic: presence of parent/root identifiers usually means this is a child slice."""
+    for k in ("ParentOrderID", "ParentId", "ParentID", "ParentClOrdID", "RootOrderID", "RootOrderId"):
+        if d.get(k):
+            return True
+    return False
+
+def _ord_or_algo_line(sym: str, ordtype: str, d: dict) -> str:
+    algo = _algo_from(d)
+    if algo:
+        role = " (child)" if _is_child_order(d) else ""
+        return f"Sym: {_md_escape(sym)} · Algo: {algo}{role}"
+    return f"Sym: {_md_escape(sym)} · OrdType: {ordtype}"
+
+def _px_line(ordtype: str, px) -> str:
+    # Hide meaningless 0.000000 for market/unknown price
+    try:
+        pxf = float(px)
+    except Exception:
+        pxf = None
+    if (ordtype or "").lower() == "market" or pxf in (None, 0.0):
+        return "Px: —"
+    return f"Px: { _fmt_px(px) }"
 # ---------------------------------------
 
 def _talos_loop(
@@ -192,9 +237,6 @@ def _talos_loop(
                     tg_token, chat_id,
                     (
                         f"🟢 *Reconnected to Talos* — {acct_str}\n"
-                        f"{sess_line}\n"
-                        f"Time: {hello_ts}\n"
-                        f"(after {delta}, attempt {retries})"
                     )
                 )
                 downtime_start = None
@@ -205,9 +247,7 @@ def _talos_loop(
                 if learned_acct and not connected_banner_sent:
                     _notify_http(
                         tg_token, chat_id,
-                        f"🟢 *Connected to Talos* — {_md_escape(learned_acct)}\n"
-                        f"Session: `{_short_id(new_session)}`\n"
-                        f"Time: {hello_ts}"
+                        f"🟢 *Connected to Talos* — {_md_escape(learned_acct)}"
                     )
                     connected_banner_sent = True
                     backoff = 1                # reset backoff after a good handshake
@@ -321,9 +361,9 @@ def _talos_loop(
                     if exec_type == "New" or ord_status == "New":
                         lines = [
                             f"🆕 *New order* - {_md_escape(learned_acct) if learned_acct else '-'}",
-                            f"Sym: {_md_escape(sym)} · OrdType: {ordtype}",
+                            _ord_or_algo_line(sym, ordtype, d),
                             _headline_from(ordqty, limitpx),
-                            f"Px: { _fmt_px(limitpx) }",
+                            _px_line(ordtype, limitpx),
                         ]
                         if comment:
                             lines.append(f"Comment: {_md_escape(comment)}")
@@ -346,9 +386,10 @@ def _talos_loop(
                             tg_token, chat_id,
                             (
                                 f"🚫 *Order Cancelled*{' [snapshot]' if initial else ''} — {_md_escape(sym)}\n"
-                                f"{acct_line}  ·  OrdType: {ordtype}\n"
+                                f"{acct_line}\n"
+                                f"{_ord_or_algo_line(sym, ordtype, d)}\n"
                                 f"{_headline_from(q_raw, px_for_view)}\n"
-                                f"Px: { _fmt_px(px_for_view) }\n"
+                                f"{_px_line(ordtype, px_for_view)}\n"
                                 f"{actor_line}\n"
                                 f"Reason: {_md_escape(reason) if reason else '-'}\n"
                                 f"OrderID: `{oid}`\n"
@@ -365,9 +406,10 @@ def _talos_loop(
                                     tg_token, chat_id,
                                     (
                                         f"✅ *Fill*{' [snapshot]' if initial else ''} — {_md_escape(sym)}\n"
-                                        f"{acct_line}  ·  OrdType: {ordtype}\n"
+                                        f"{acct_line}\n"
+                                        f"{_ord_or_algo_line(sym, ordtype, d)}\n"
                                         f"{_headline_from(lastqty, lastpx)}\n"
-                                        f"Px: { _fmt_px(lastpx) }\n"
+                                        f"{_px_line(ordtype, lastpx)}\n"
                                         f"{actor_line}\n"
                                         f"OrderID: `{oid}`\n"
                                         f"Time: {when}"
@@ -386,9 +428,10 @@ def _talos_loop(
                                 tg_token, chat_id,
                                 (
                                     f"🎯 *Order Filled*{' [snapshot]' if initial else ''} — {_md_escape(sym)}\n"
-                                    f"{acct_line}  ·  OrdType: {ordtype}\n"
+                                    f"{acct_line}\n"
+                                    f"{_ord_or_algo_line(sym, ordtype, d)}\n"
                                     f"{_headline_from(q_raw, px_for_view)}\n"
-                                    f"Px: { _fmt_px(px_for_view) }\n"
+                                    f"{_px_line(ordtype, px_for_view)}\n"
                                     f"{actor_line}\n"
                                     f"OrderID: `{oid}`\n"
                                     f"Time: {when}"

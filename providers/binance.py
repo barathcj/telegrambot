@@ -82,3 +82,62 @@ def get_funding_history(coin: str = "BTC", limit: int = 10) -> List[dict]:
 
 def ms_to_dt_utc(ms: int) -> datetime:
     return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+
+def get_book_ticker(coin: str = "BTC") -> Optional[dict]:
+    """
+    GET /api/v3/ticker/bookTicker?symbol=BTCUSDT
+    Best bid/ask on spot.
+    """
+    sym = _sym(coin)
+    res = _get(f"{SPOT_BASE}/api/v3/ticker/bookTicker", {"symbol": sym})
+    if not res:
+        return None
+    try:
+        return {"bid": float(res["bidPrice"]), "ask": float(res["askPrice"])}
+    except Exception:
+        return None
+
+
+def get_funding_info(coin: str = "BTC") -> dict:
+    """
+    GET /fapi/v1/fundingInfo   (no params)
+    Returns {'fundingRateCap', 'fundingRateFloor', 'fundingIntervalHours'} for the symbol
+    if Binance has an *adjustment* live; otherwise returns {} (N/A).
+    """
+    sym = _sym(coin)
+    res = _get(f"{FUT_BASE}/fapi/v1/fundingInfo")  # list
+    if not isinstance(res, list):
+        return {}
+    for item in res:
+        if item.get("symbol") == sym:
+            return {
+                "fundingRateCap": float(item["adjustedFundingRateCap"]) if item.get("adjustedFundingRateCap") is not None else None,
+                "fundingRateFloor": float(item["adjustedFundingRateFloor"]) if item.get("adjustedFundingRateFloor") is not None else None,
+                "fundingIntervalHours": float(item["fundingIntervalHours"]) if item.get("fundingIntervalHours") is not None else None,
+            }
+    return {}
+
+
+
+def get_funding_series(coin: str = "BTC", limit: int = 1000) -> List[dict]:
+    """
+    GET /fapi/v1/fundingRate?symbol=BTCUSDT&limit=1000
+    Up to the last 1000 funding prints (per interval).
+    """
+    sym = _sym(coin)
+    limit = max(1, min(limit, 1000))
+    res = _get(f"{FUT_BASE}/fapi/v1/fundingRate", {"symbol": sym, "limit": limit})
+    if not isinstance(res, list):
+        return []
+    out = []
+    for row in res:
+        try:
+            out.append({
+                "fundingTime": int(row["fundingTime"]),
+                "fundingRate": float(row["fundingRate"]),
+            })
+        except Exception:
+            continue
+    # ensure chronological order
+    out.sort(key=lambda r: r["fundingTime"])
+    return out
