@@ -11,7 +11,7 @@ from config import (
 )
 from talos_watcher_fn import start_talos_watcher
 
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, Application
 from auth import _guard_commands, whoami_cmd
 from deribit_handlers import (
     start_cmd, ping_cmd, spot_cmd,
@@ -19,8 +19,10 @@ from deribit_handlers import (
     fsbtc_cmd, fseth_cmd, option_cmd, talos
 )
 from binance_handlers import (
-    bspot_cmd, bfund_cmd, bfundhist_cmd
+    bspot_cmd, bfund_cmd, bfundhist_cmd, bcurve_cmd
 )
+
+from talos_handlers import talos_orders_cmd
 
 async def on_error(update, context):
     try:
@@ -77,6 +79,11 @@ def main():
     app.add_handler(CommandHandler("bspot", bspot_cmd), group=1)
     app.add_handler(CommandHandler("bfund", bfund_cmd), group=1)
     app.add_handler(CommandHandler("bfundhist", bfundhist_cmd), group=1)
+    app.add_handler(CommandHandler("bcurve", bcurve_cmd), group=1)
+
+
+    # Talos handlers
+    app.add_handler(CommandHandler("talos_orders", talos_orders_cmd), group=1)
 
     # whoami (exempted in guard)
     app.add_handler(CommandHandler("whoami", whoami_cmd), group=1)
