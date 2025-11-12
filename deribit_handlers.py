@@ -2,7 +2,14 @@
 from html import escape
 from telegram import Update
 from telegram.ext import ContextTypes
-from providers.deribit import get_index_price
+from collections import defaultdict
+from datetime import datetime, timezone, timedelta
+from providers.deribit import (
+    get_index_price,
+    get_perpetual_summary,
+    get_funding_rate_history,
+    ms_to_dt_utc,
+)
 from futures import fs_matrix_table, render_swap_table
 from options import render_option_chain_sections, pack_sections_into_messages
 from auth import require_auth
@@ -93,3 +100,197 @@ async def option_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.message.chat
     for msg in messages:
         await chat.send_message(text=f"<pre>{escape(msg)}</pre>", parse_mode="HTML")
+
+
+def _format_pct(x: float, dp: int = 4) -> str:
+    return f"{x*100:.{dp}f}%"
+
+def _resolve_perp_targets(raw: str | None) -> tuple[str, str, list[str]]:
+    """
+    Returns (display_label, base_coin, instrument_candidates)
+    """
+    s = (raw or "BTC").strip().upper()
+    s = s.replace("/", "_").replace(" ", "")
+    display = s
+    if s.endswith("-PERPETUAL"):
+        core = s[:-len("-PERPETUAL")]
+    else:
+        core = s
+    # normalize repeated separators
+    core = core.replace("--", "-").replace("__", "_")
+    core = core.strip("-_")
+    if not core:
+        core = "BTC"
+    if "_" in core:
+        base = core.split("_", 1)[0]
+    else:
+        base = core.split("-", 1)[0]
+    if "_" not in display and "-" not in display:
+        display = base
+
+    candidates: list[str] = []
+
+    def add_candidate(name: str):
+        name = name.replace("--", "-").replace("__", "_").strip()
+        if name and name not in candidates:
+            candidates.append(name)
+
+    if s.endswith("-PERPETUAL"):
+        add_candidate(s)
+    else:
+        # primary guess (keep underscores between base/quote if provided)
+        add_candidate(f"{core}-PERPETUAL")
+        # fallback: if no explicit quote, try USDC linear + inverse (non BTC/ETH)
+        if "_" not in core and core not in {"BTC", "ETH"}:
+            add_candidate(f"{core}_USDC-PERPETUAL")
+        else:
+            add_candidate(f"{base}-PERPETUAL")
+    # ensure classic inverse variant always attempted
+    add_candidate(f"{base}-PERPETUAL")
+
+    return (display, base, candidates)
+
+@require_auth
+async def dfund_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    parts = context.args or []
+    display, _base, instruments = _resolve_perp_targets(parts[0] if parts else "BTC")
+
+    summary = None
+    instrument_used = None
+    for inst in instruments:
+        summary = get_perpetual_summary(inst)
+        if summary:
+            instrument_used = inst
+            break
+
+    if not summary or not instrument_used:
+        await update.message.chat.send_message(f"Deribit {display} funding unavailable.")
+        return
+
+    mark = summary.get("mark_price")
+    index = summary.get("index_price")
+
+    def _per_interval() -> float:
+        val = summary.get("funding_8h")
+        try:
+            return float(val) if val is not None else 0.0
+        except Exception:
+            return 0.0
+
+    per_interval = _per_interval()
+    interval_hours = 8.0  # Deribit funding is every 8h
+    periods_per_day = 24.0 / interval_hours
+    daily = per_interval * periods_per_day
+    annual = daily * 365.0
+
+    lines = [
+        f"{instrument_used} funding (Deribit)",
+        f"Mark: {mark:,.2f}" if mark is not None else "Mark: N/A",
+        f"Index: {index:,.2f}" if index is not None else "Index: N/A",
+        f"Last funding: {_format_pct(per_interval, 4)}",
+        f"≈ {_format_pct(daily, 4)} daily",
+        f"≈ {_format_pct(annual, 2)} annualized",
+    ]
+
+    text = "<pre>" + escape("\n".join(lines)) + "</pre>"
+    await update.message.chat.send_message(text, parse_mode="HTML")
+
+@require_auth
+async def dfundhist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /dfundhist [coin] [days<=20]
+    /dfundhist <coin> <start> - <end|now>
+    """
+    parts = context.args or []
+    display, _base, instruments = _resolve_perp_targets(parts[0] if parts else "BTC")
+
+    summary = None
+    instrument_used = None
+    for inst in instruments:
+        summary = get_perpetual_summary(inst)
+        if summary:
+            instrument_used = inst
+            break
+
+    if not summary or not instrument_used:
+        await update.message.chat.send_message(f"Deribit {display} funding unavailable.")
+        return
+
+    def _parse_date(s: str) -> datetime:
+        if s.lower() == "now":
+            return datetime.now(timezone.utc)
+        fmts = ["%d%b%y", "%d%b%Y", "%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"]
+        for fmt in fmts:
+            try:
+                return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+        raise ValueError(f"Unrecognized date: {s}")
+
+    # Absolute range mode
+    if len(parts) == 4 and parts[2] == "-":
+        try:
+            dt0 = _parse_date(parts[1])
+            dt1 = _parse_date(parts[3])
+        except Exception as e:
+            await update.message.chat.send_message(f"Date parse error: {e}")
+            return
+        if dt0 > dt1:
+            dt0, dt1 = dt1, dt0
+        rows = get_funding_rate_history(instrument_used, start_ms=int(dt0.timestamp()*1000), end_ms=int(dt1.timestamp()*1000))
+        if not rows:
+            await update.message.chat.send_message(f"No funding data for {display}.")
+            return
+
+        total = sum(r["funding_rate"] for r in rows)
+        t_first = ms_to_dt_utc(rows[0]["timestamp"])
+        t_last = ms_to_dt_utc(rows[-1]["timestamp"])
+        wall_days = max((t_last - t_first).total_seconds() / 86400.0, 1e-9)
+        apr_simple = total * (365.0 / wall_days)
+
+        msg = (
+            f"{instrument_used} funding (Deribit)\n"
+            f"Range: {t_first.strftime('%d-%b-%Y %H:%M UTC')} → {t_last.strftime('%d-%b-%Y %H:%M UTC')}\n"
+            f"Observations: {len(rows)}: 8h interval\n"
+            f"Cumulative funding: {_format_pct(total, 4)}\n"
+            f"Days: {wall_days:.2f}\n"
+            f"Annualized (simple): {_format_pct(apr_simple, 2)}"
+        )
+        await update.message.chat.send_message(f"<pre>{escape(msg)}</pre>", parse_mode="HTML")
+        return
+
+    # Rolling daily history
+    try:
+        limit_days = int(parts[1]) if len(parts) > 1 else 10
+    except Exception:
+        limit_days = 10
+    limit_days = max(1, min(limit_days, 20))
+
+    now = datetime.now(timezone.utc)
+    start_ms = int((now - timedelta(days=limit_days + 1)).timestamp() * 1000)
+    rows = get_funding_rate_history(instrument_used, start_ms=start_ms, count=limit_days * 6)
+    if not rows:
+        await update.message.chat.send_message(f"No funding history for {display}.")
+        return
+
+    daily = defaultdict(float)
+    for r in rows:
+        dt = ms_to_dt_utc(r["timestamp"])
+        date_str = dt.strftime("%Y-%m-%d")
+        daily[date_str] += r["funding_rate"]
+
+    if not daily:
+        await update.message.chat.send_message(f"No funding history for {display}.")
+        return
+
+    sorted_days = sorted(daily.keys(), reverse=True)[:limit_days]
+    lines = [f"{instrument_used} daily funding history (Deribit):", ""]
+    lines.append("Date        Daily Rate   Annualized")
+    lines.append("-----------------------------------")
+    for d in sorted_days:
+        dr = daily[d]
+        ann = dr * 365.0
+        lines.append(f"{d}   {dr*100:.4f}%   {ann*100:.2f}%")
+
+    body = "\n".join(lines)
+    await update.message.chat.send_message(f"<pre>{escape(body)}</pre>", parse_mode="HTML")
