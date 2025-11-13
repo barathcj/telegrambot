@@ -96,3 +96,78 @@ def get_option_instruments_map(currency: str = "BTC") -> dict[str, int]:
         for row in res
         if row.get("expiration_timestamp", 0) > 0
     }
+
+def _summary_by_instrument(instrument_name: str) -> Optional[dict]:
+    res = _get("/public/get_book_summary_by_instrument", {"instrument_name": instrument_name})
+    if isinstance(res, list):
+        return res[0] if res else None
+    if isinstance(res, dict):
+        data = res.get("data")
+        if isinstance(data, list) and data:
+            return data[0]
+        return res
+    return None
+
+def get_perpetual_summary(instrument_name: str) -> Optional[dict]:
+    """
+    Return book summary for the provided perpetual instrument name.
+    """
+    if not instrument_name:
+        return None
+    inst = instrument_name.upper()
+    # First try a targeted lookup (fast for all instruments)
+    row = _summary_by_instrument(inst)
+    if row:
+        return row
+    # Fallback: attempt currency sweep if instrument resembles BASE[-/_QUOTE]-PERPETUAL
+    base = inst.split("-")[0]
+    summaries = get_futures_summaries(base) or []
+    for r in summaries:
+        if str(r.get("instrument_name", "")).upper() == inst:
+            return r
+    return None
+
+def get_funding_rate_history(
+    instrument_name: str,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    count: int | None = None
+) -> list[dict]:
+    """
+    Fetch historical funding prints for the perpetual via /public/get_funding_rate_history.
+    Returns chronological rows [{timestamp, funding_rate}]
+    """
+    inst = (instrument_name or "").upper()
+    if not inst:
+        return []
+    params: Dict[str, int | str] = {"instrument_name": inst}
+    if start_ms is not None:
+        params["start_timestamp"] = int(start_ms)
+    if end_ms is not None:
+        params["end_timestamp"] = int(end_ms)
+    if count is not None:
+        params["count"] = max(1, min(int(count), 500))
+    res = _get("/public/get_funding_rate_history", params)
+    if res is None:
+        return []
+
+    if isinstance(res, list):
+        raw = res
+    elif isinstance(res, dict):
+        raw = res.get("data") or res.get("entries") or []
+    else:
+        raw = []
+
+    out: list[dict] = []
+    for row in raw:
+        ts = row.get("timestamp") or row.get("time") or row.get("event_timestamp")
+        fr = row.get("funding_rate") or row.get("value")
+        if ts is None or fr is None:
+            continue
+        try:
+            out.append({"timestamp": int(ts), "funding_rate": float(fr)})
+        except Exception:
+            continue
+
+    out.sort(key=lambda r: r["timestamp"])
+    return out

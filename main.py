@@ -16,10 +16,15 @@ from auth import _guard_commands, whoami_cmd
 from deribit_handlers import (
     start_cmd, ping_cmd, spot_cmd,
     bsbtc_cmd, ssbtc_cmd, bseth_cmd, sseth_cmd,
-    fsbtc_cmd, fseth_cmd, option_cmd, talos
+    fsbtc_cmd, fseth_cmd, option_cmd, talos,
+    dfund_cmd, dfundhist_cmd
 )
 from binance_handlers import (
     bspot_cmd, bfund_cmd, bfundhist_cmd, bcurve_cmd
+)
+
+from coinbase_handlers import (
+    cbfund_cmd, cbfundhist_cmd
 )
 
 from talos_handlers import talos_orders_cmd
@@ -74,12 +79,18 @@ def main():
     app.add_handler(CommandHandler(
         ["sceth","bceth","speth","bpeth","scbtc","bcbtc","spbtc","bpbtc"], option_cmd
     ), group=1)
+    app.add_handler(CommandHandler("dfund", dfund_cmd), group=1)
+    app.add_handler(CommandHandler("dfundhist", dfundhist_cmd), group=1)
 
     # Binance handlers
     app.add_handler(CommandHandler("bspot", bspot_cmd), group=1)
     app.add_handler(CommandHandler("bfund", bfund_cmd), group=1)
     app.add_handler(CommandHandler("bfundhist", bfundhist_cmd), group=1)
     app.add_handler(CommandHandler("bcurve", bcurve_cmd), group=1)
+
+    # Coinbase handlers
+    app.add_handler(CommandHandler("cbfund", cbfund_cmd), group=1)
+    app.add_handler(CommandHandler("cbfundhist", cbfundhist_cmd), group=1)
 
 
     # Talos handlers
