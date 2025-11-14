@@ -9,6 +9,7 @@ from providers.deribit import (
     get_perpetual_summary,
     get_funding_rate_history,
     ms_to_dt_utc,
+    InstrumentNotOpenError,
 )
 from futures import fs_matrix_table, render_swap_table
 from options import render_option_chain_sections, pack_sections_into_messages
@@ -140,15 +141,25 @@ def _resolve_perp_targets(raw: str | None) -> tuple[str, str, list[str]]:
     else:
         # primary guess (keep underscores between base/quote if provided)
         add_candidate(f"{core}-PERPETUAL")
-        # fallback: if no explicit quote, try USDC linear + inverse (non BTC/ETH)
-        if "_" not in core and core not in {"BTC", "ETH"}:
-            add_candidate(f"{core}_USDC-PERPETUAL")
-        else:
-            add_candidate(f"{base}-PERPETUAL")
-    # ensure classic inverse variant always attempted
+    # Always attempt classic inverse plus USDC linear variants.
     add_candidate(f"{base}-PERPETUAL")
+    add_candidate(f"{base}_USDC-PERPETUAL")
 
     return (display, base, candidates)
+
+def _iter_open_perp_summaries(candidates: list[str]):
+    """
+    Yields (instrument_name, summary) pairs for instruments that appear open.
+    """
+    for inst in candidates:
+        summary = get_perpetual_summary(inst)
+        if not summary:
+            continue
+        state = str(summary.get("state") or "").lower()
+        if state and state not in {"open", "live"}:
+            continue
+        resolved = str(summary.get("instrument_name") or inst).upper()
+        yield resolved, summary
 
 @require_auth
 async def dfund_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -157,11 +168,10 @@ async def dfund_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     summary = None
     instrument_used = None
-    for inst in instruments:
-        summary = get_perpetual_summary(inst)
-        if summary:
-            instrument_used = inst
-            break
+    for inst_name, inst_summary in _iter_open_perp_summaries(instruments):
+        summary = inst_summary
+        instrument_used = inst_name
+        break
 
     if not summary or not instrument_used:
         await update.message.chat.send_message(f"Deribit {display} funding unavailable.")
@@ -204,18 +214,6 @@ async def dfundhist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = context.args or []
     display, _base, instruments = _resolve_perp_targets(parts[0] if parts else "BTC")
 
-    summary = None
-    instrument_used = None
-    for inst in instruments:
-        summary = get_perpetual_summary(inst)
-        if summary:
-            instrument_used = inst
-            break
-
-    if not summary or not instrument_used:
-        await update.message.chat.send_message(f"Deribit {display} funding unavailable.")
-        return
-
     def _parse_date(s: str) -> datetime:
         if s.lower() == "now":
             return datetime.now(timezone.utc)
@@ -227,6 +225,18 @@ async def dfundhist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
         raise ValueError(f"Unrecognized date: {s}")
 
+    def _pick_history(fetch_rows):
+        had_summary = False
+        for inst_name, inst_summary in _iter_open_perp_summaries(instruments):
+            had_summary = True
+            try:
+                rows = fetch_rows(inst_name)
+            except InstrumentNotOpenError:
+                continue
+            if rows:
+                return inst_name, inst_summary, rows, had_summary
+        return None, None, [], had_summary
+
     # Absolute range mode
     if len(parts) == 4 and parts[2] == "-":
         try:
@@ -237,9 +247,15 @@ async def dfundhist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if dt0 > dt1:
             dt0, dt1 = dt1, dt0
-        rows = get_funding_rate_history(instrument_used, start_ms=int(dt0.timestamp()*1000), end_ms=int(dt1.timestamp()*1000))
+        def _fetch(inst_name: str):
+            return get_funding_rate_history(inst_name, start_ms=int(dt0.timestamp()*1000), end_ms=int(dt1.timestamp()*1000))
+
+        instrument_used, summary, rows, had_summary = _pick_history(_fetch)
         if not rows:
-            await update.message.chat.send_message(f"No funding data for {display}.")
+            if not had_summary:
+                await update.message.chat.send_message(f"Deribit {display} funding unavailable.")
+            else:
+                await update.message.chat.send_message(f"No funding data for {display}.")
             return
 
         total = sum(r["funding_rate"] for r in rows)
@@ -267,14 +283,24 @@ async def dfundhist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     limit_days = max(1, min(limit_days, 20))
 
     now = datetime.now(timezone.utc)
-    start_ms = int((now - timedelta(days=limit_days + 1)).timestamp() * 1000)
-    rows = get_funding_rate_history(instrument_used, start_ms=start_ms, count=limit_days * 6)
+    cutoff_ms = int((now - timedelta(days=limit_days + 1)).timestamp() * 1000)
+    end_ms = int(now.timestamp() * 1000)
+
+    def _fetch(inst_name: str):
+        return get_funding_rate_history(inst_name, start_ms=cutoff_ms, end_ms=end_ms)
+
+    instrument_used, _summary, rows, had_summary = _pick_history(_fetch)
     if not rows:
-        await update.message.chat.send_message(f"No funding history for {display}.")
+        if not had_summary:
+            await update.message.chat.send_message(f"Deribit {display} funding unavailable.")
+        else:
+            await update.message.chat.send_message(f"No funding history for {display}.")
         return
 
     daily = defaultdict(float)
     for r in rows:
+        if r["timestamp"] < cutoff_ms:
+            continue
         dt = ms_to_dt_utc(r["timestamp"])
         date_str = dt.strftime("%Y-%m-%d")
         daily[date_str] += r["funding_rate"]
