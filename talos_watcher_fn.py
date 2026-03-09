@@ -1,5 +1,6 @@
 # talos_watcher_fn.py
 import hmac, hashlib, base64, datetime, json, time, threading
+from collections import deque
 from urllib.parse import urlparse
 import certifi, requests
 from websocket import create_connection, WebSocketTimeoutException, WebSocketBadStatusException
@@ -138,6 +139,158 @@ def _fmt_dur(sec: float) -> str:
     if m: return f"{m}m {s}s"
     return f"{s}s"
 
+def _parse_iso_to_epoch(ts_raw) -> float | None:
+    if not ts_raw:
+        return None
+    s = str(ts_raw).strip()
+    if not s:
+        return None
+    try:
+        s = s.replace("Z", "+00:00")
+        return datetime.datetime.fromisoformat(s).timestamp()
+    except Exception:
+        return None
+
+def _summary_header(interval_sec: int, acct: str | None) -> str:
+    hours = interval_sec / 3600
+    label = f"{hours:g}h" if hours >= 1 else _fmt_dur(interval_sec)
+    acct_part = _md_escape(acct) if acct else "Talos"
+    return f"🕐 *Talos summary ({label})* — {acct_part}"
+
+def _build_periodic_summary(
+    window_events: list[dict],
+    interval_sec: int,
+    acct: str | None,
+    verbose: bool = False,
+    max_lines: int = 6,
+) -> str:
+    filled_oids = {e["oid"] for e in window_events if e["kind"] == "filled" and e.get("oid")}
+    partial_oids = {e["oid"] for e in window_events if e["kind"] == "partial" and e.get("oid")}
+    partial_execs = sum(1 for e in window_events if e["kind"] == "partial")
+
+    lines = [
+        _summary_header(interval_sec, acct),
+        f"Completed orders: *{len(filled_oids)}*",
+        f"Partially filled orders: *{len(partial_oids)}*",
+        f"Partial-fill executions: *{partial_execs}*",
+    ]
+
+    if not window_events:
+        lines.append("No completed or partial-fill activity in this window.")
+        return "\n".join(lines)
+
+    if verbose:
+        lines.append("Recent activity:")
+        for ev in sorted(window_events, key=lambda x: x["ts"], reverse=True)[:max(max_lines, 1)]:
+            icon = "🎯" if ev["kind"] == "filled" else "✅"
+            qty = _fmt_qty(ev.get("qty"))
+            px = _fmt_px(ev.get("px"))
+            sym = _md_escape(ev.get("sym") or "-")
+            side = _md_escape(ev.get("side") or "-")
+            lines.append(f"• {icon} {side} {sym} · {_md_escape(qty)} @ {_md_escape(px)}")
+        return "\n".join(lines)
+
+    # Default: compact rollup by order to reduce noise from many tiny fills.
+    partial_rollup: dict[str, dict] = {}
+    filled_rollup: dict[str, dict] = {}
+    for ev in window_events:
+        oid = str(ev.get("oid") or "-")
+        target = filled_rollup if ev["kind"] == "filled" else partial_rollup
+        cur = target.get(oid)
+        if cur is None:
+            cur = {
+                "oid": oid,
+                "sym": ev.get("sym") or "-",
+                "side": ev.get("side") or "-",
+                "ts": float(ev.get("ts") or 0),
+                "fills": 0,
+                "qty_total": 0.0,
+                "px_qty_sum": 0.0,
+                "px_last": ev.get("px"),
+            }
+            target[oid] = cur
+        cur["fills"] += 1
+        cur["ts"] = max(cur["ts"], float(ev.get("ts") or 0))
+        cur["px_last"] = ev.get("px")
+        try:
+            qf = float(ev.get("qty") or 0)
+            cur["qty_total"] += qf
+            try:
+                pf = float(ev.get("px"))
+                cur["px_qty_sum"] += qf * pf
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    compact_rows = list(filled_rollup.values()) + list(partial_rollup.values())
+    compact_rows.sort(key=lambda x: x["ts"], reverse=True)
+
+    lines.append("Recent activity (aggregated by order):")
+    shown = 0
+    for r in compact_rows:
+        if shown >= max(max_lines, 1):
+            break
+        is_filled = r["oid"] in filled_rollup
+        icon = "🎯" if is_filled else "✅"
+        qty_txt = _fmt_qty(r["qty_total"])
+        avg_px = None
+        if r["qty_total"] > 0 and r["px_qty_sum"] > 0:
+            avg_px = _fmt_px(r["px_qty_sum"] / r["qty_total"])
+        px_txt = avg_px if (avg_px and not is_filled) else _fmt_px(r["px_last"])
+        fills_txt = f" · fills {r['fills']}" if not is_filled else ""
+        oid_txt = _md_escape(_short_id(r["oid"], 10))
+        lines.append(
+            f"• {icon} {_md_escape(r['side'])} {_md_escape(r['sym'])}{fills_txt} · qty {_md_escape(qty_txt)} @ {_md_escape(px_txt)} · OID `{oid_txt}`"
+        )
+        shown += 1
+
+    if len(compact_rows) > shown:
+        lines.append(f"... and {len(compact_rows) - shown} more orders")
+
+    return "\n".join(lines)
+
+def _hour_floor_epoch(ts: float | None = None) -> float:
+    now = datetime.datetime.fromtimestamp(ts or time.time())
+    return now.replace(minute=0, second=0, microsecond=0).timestamp()
+
+def _next_hour_epoch(ts: float | None = None) -> float:
+    return _hour_floor_epoch(ts) + 3600
+
+def _collect_window_events(summary_events: deque, summary_lock: threading.Lock, window_start: float, window_end: float) -> list[dict]:
+    with summary_lock:
+        while summary_events and summary_events[0]["ts"] < (window_start - 300):
+            summary_events.popleft()
+        return [e for e in summary_events if window_start <= e["ts"] < window_end]
+
+def get_talos_summary_blocks(
+    window_sec: int = 3600,
+    anchored_to_hour: bool = False,
+    verbose: bool = False,
+    max_lines: int = 6,
+) -> list[str]:
+    blocks: list[str] = []
+    for name, watcher in list(_WATCHERS.items()):
+        lock = watcher.get("summary_lock")
+        events = watcher.get("summary_events")
+        if not lock or events is None:
+            continue
+        now = time.time()
+        window_end = _hour_floor_epoch(now) if anchored_to_hour else now
+        window_start = window_end - max(int(window_sec or 3600), 60)
+        with lock:
+            acct = watcher.get("learned_account_label") or watcher.get("account_label") or name
+        blocks.append(
+            _build_periodic_summary(
+                _collect_window_events(events, lock, window_start, window_end),
+                window_end - window_start,
+                acct,
+                verbose=verbose,
+                max_lines=max_lines,
+            )
+        )
+    return blocks
+
 # ---- algo detection helpers ----
 def _algo_from(d: dict) -> str | None:
     """
@@ -185,6 +338,7 @@ def _px_line(ordtype: str, px) -> str:
 # ---------------------------------------
 
 def _talos_loop(
+    watcher_name: str,
     stop_evt: threading.Event,
     tg_token: str, chat_id: int,
     ws_url: str, api_key: str, api_secret: str,
@@ -192,7 +346,11 @@ def _talos_loop(
     exclude_users: set[str],
     show_per_exec_fill: bool,
     account_label: str | None,
-    subaccount_filter: set[str] | None
+    subaccount_filter: set[str] | None,
+    periodic_summary_enabled: bool,
+    periodic_summary_interval_sec: int,
+    summary_events: deque,
+    summary_lock: threading.Lock,
 ):
     exclude_upper = {u.upper() for u in (exclude_users or set())}
     filter_upper = {s.upper() for s in (subaccount_filter or set())}
@@ -208,6 +366,7 @@ def _talos_loop(
     retries = 0             # reconnect attempts since last good link
     prev_session = None     # last known session id
     # ---
+    next_summary_at = _next_hour_epoch()
 
     while not stop_evt.is_set():
         try:
@@ -261,11 +420,30 @@ def _talos_loop(
                 stream["User"] = subscribe_user
             ws.send(json.dumps({"reqid": 100, "type": "subscribe", "streams": [stream]}))
 
+            def _maybe_send_summary():
+                nonlocal next_summary_at
+                if not periodic_summary_enabled:
+                    return
+                now = time.time()
+                if now < next_summary_at:
+                    return
+                window_end = _hour_floor_epoch(now)
+                window_start = window_end - periodic_summary_interval_sec
+                window_events = _collect_window_events(summary_events, summary_lock, window_start, window_end)
+                _notify_http(
+                    tg_token,
+                    chat_id,
+                    _build_periodic_summary(window_events, periodic_summary_interval_sec, learned_acct),
+                )
+                next_summary_at = _next_hour_epoch(now)
+
             while not stop_evt.is_set():
+                _maybe_send_summary()
                 try:
                     msg = json.loads(ws.recv())
                 except WebSocketTimeoutException:
                     ws.send(json.dumps({"reqid": 1, "type": "ping", "ts": _now_utc_iso()}))
+                    _maybe_send_summary()
                     continue
 
                 if msg.get("type") == "error":
@@ -287,6 +465,9 @@ def _talos_loop(
                     # learn banner label if not provided
                     if not learned_acct and event_acct:
                         learned_acct = str(event_acct)
+                        with summary_lock:
+                            if watcher_name in _WATCHERS:
+                                _WATCHERS[watcher_name]["learned_account_label"] = learned_acct
 
                     # send merged banner once
                     if learned_acct and hello_info and not connected_banner_sent:
@@ -323,6 +504,7 @@ def _talos_loop(
                     limitpx = _price_from(d)
                     ordtype = _ordtype_str(d.get("OrdType"))
                     comment = d.get("Comments")
+                    leaves_zero = (leaves == 0 or leaves == "0")
 
                     acct_line = f"Acct: {_md_escape(event_acct) if event_acct else (_md_escape(learned_acct) if learned_acct else '-')}"
                     actor_line = f"By: `{_md_escape(user)}`"
@@ -356,6 +538,26 @@ def _talos_loop(
                         unit_str = f' {unit}' if unit and unit != '-' else ''
                         return f"{_md_escape(side)} { _fmt_qty(q_raw) }{unit_str}"
                     # ========================================================
+
+                    # Hourly summary event capture (skip snapshot payload)
+                    if periodic_summary_enabled and not initial:
+                        is_filled = (ord_status == "Filled" or leaves_zero)
+                        is_partial = (
+                            ord_status == "PartiallyFilled"
+                            or (exec_type == "Trade" and not is_filled)
+                        )
+                        if is_filled or is_partial:
+                            evt_ts = _parse_iso_to_epoch(when) or time.time()
+                            with summary_lock:
+                                summary_events.append({
+                                    "ts": evt_ts,
+                                    "kind": "filled" if is_filled else "partial",
+                                    "oid": oid,
+                                    "sym": sym,
+                                    "side": side,
+                                    "qty": (cumqty or ordqty or lastqty) if is_filled else (lastqty or cumqty or ordqty),
+                                    "px": (avgpx or lastpx or limitpx) if is_filled else (lastpx or avgpx or limitpx),
+                                })
 
                     # 🆕 New
                     if exec_type == "New" or ord_status == "New":
@@ -419,7 +621,6 @@ def _talos_loop(
                             pass
 
                     # 🎯 Fully filled (once)
-                    leaves_zero = (leaves == 0 or leaves == "0")
                     if ord_status == "Filled" or leaves_zero:
                         if oid and oid not in filled_announced:
                             q_raw       = cumqty or ordqty or lastqty
@@ -438,6 +639,7 @@ def _talos_loop(
                                 )
                             )
                             filled_announced.add(oid)
+                _maybe_send_summary()
 
             try:
                 ws.close()
@@ -471,15 +673,20 @@ def start_talos_watcher(
     exclude_users: set[str] | None = None,
     show_per_exec_fill: bool = False,
     account_label: str | None = None,
-    subaccount_filter: set[str] | None = None
+    subaccount_filter: set[str] | None = None,
+    periodic_summary_enabled: bool = False,
+    periodic_summary_interval_sec: int = 3600,
 ):
     """Start (or no-op if running) an independent watcher identified by 'name'."""
     if name in _WATCHERS and _WATCHERS[name]["thread"].is_alive():
         return
     stop_evt = threading.Event()
+    summary_events = deque()
+    summary_lock = threading.Lock()
     th = threading.Thread(
         target=_talos_loop,
         args=(
+            name,
             stop_evt,
             tg_token, chat_id,
             ws_url, api_key, api_secret,
@@ -487,11 +694,22 @@ def start_talos_watcher(
             (exclude_users or set()),
             show_per_exec_fill,
             account_label,
-            (subaccount_filter or set())
+            (subaccount_filter or set()),
+            periodic_summary_enabled,
+            max(int(periodic_summary_interval_sec or 3600), 60),
+            summary_events,
+            summary_lock,
         ),
         daemon=True
     )
-    _WATCHERS[name] = {"thread": th, "stop": stop_evt}
+    _WATCHERS[name] = {
+        "thread": th,
+        "stop": stop_evt,
+        "summary_events": summary_events,
+        "summary_lock": summary_lock,
+        "account_label": account_label,
+        "learned_account_label": account_label,
+    }
     th.start()
 
 def stop_talos_watcher(name: str, timeout: float = 5.0):

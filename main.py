@@ -1,5 +1,6 @@
 # main.py
 import logging
+import os
 from config import TOKEN
 
 
@@ -7,7 +8,7 @@ from config import (
     PRIME_TALOS_WS_URL, PRIME_TALOS_API_KEY, PRIME_TALOS_API_SECRET, 
     ASIA_TALOS_WS_URL, ASIA_TALOS_API_KEY, ASIA_TALOS_API_SECRET, 
     TALOS_CHAT_ID, TALOS_SUBSCRIBE_USER, TALOS_EXCLUDE_USERS, 
-    TALOS_SHOW_PER_EXEC_FILL
+    TALOS_SHOW_PER_EXEC_FILL,
 )
 from talos_watcher_fn import start_talos_watcher
 
@@ -27,7 +28,17 @@ from coinbase_handlers import (
     cbfund_cmd, cbfundhist_cmd
 )
 
-from talos_handlers import talos_orders_cmd
+from talos_handlers import talos_orders_cmd, talos_summary_cmd
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("bot.log", encoding="utf-8")
+    ],
+    force=True,
+)
 
 async def on_error(update, context):
     try:
@@ -35,12 +46,29 @@ async def on_error(update, context):
     except Exception:
         pass
 
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in {"1", "true", "yes", "on"}
+
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    try:
+        return int(v)
+    except Exception:
+        return default
+
 
 def main():
     if not TOKEN:
         raise RuntimeError("Set your Telegram TOKEN in config.py")
 
     app = ApplicationBuilder().token(TOKEN).build()
+    periodic_summary_enabled = _env_bool("TALOS_PERIODIC_SUMMARY_ENABLED", True)
+    periodic_summary_interval_sec = max(_env_int("TALOS_PERIODIC_SUMMARY_INTERVAL_SEC", 3600), 60)
 
     # BitGo Prime Delaware (own creds)
     start_talos_watcher(
@@ -49,6 +77,8 @@ def main():
         ws_url=PRIME_TALOS_WS_URL, api_key=PRIME_TALOS_API_KEY, api_secret=PRIME_TALOS_API_SECRET,
         exclude_users={"BITGO-API"},
         account_label="BitGo Prime Delaware",
+        periodic_summary_enabled=periodic_summary_enabled,
+        periodic_summary_interval_sec=periodic_summary_interval_sec,
     )
 
     # BitGo Asia (own creds; cover both SG/HK under one watcher label)
@@ -59,6 +89,8 @@ def main():
         exclude_users={"BITGO-API"},
         account_label="BitGo Asia",
         subaccount_filter={"Bitgo SG", "Bitgo HK"},  # only pass these two
+        periodic_summary_enabled=periodic_summary_enabled,
+        periodic_summary_interval_sec=periodic_summary_interval_sec,
     )
 
     # Guard first
@@ -95,6 +127,7 @@ def main():
 
     # Talos handlers
     app.add_handler(CommandHandler("talos_orders", talos_orders_cmd), group=1)
+    app.add_handler(CommandHandler(["talos_summary", "talos_update"], talos_summary_cmd), group=1)
 
     # whoami (exempted in guard)
     app.add_handler(CommandHandler("whoami", whoami_cmd), group=1)

@@ -5,6 +5,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 from auth import require_auth
 from providers.talos_rest import TalosRestClient, OPEN_STATUSES_DEFAULT as OPEN_STATUSES
+from talos_watcher_fn import get_talos_summary_blocks
 
 from config import (
     PRIME_TALOS_WS_URL, PRIME_TALOS_API_KEY, PRIME_TALOS_API_SECRET,
@@ -227,3 +228,37 @@ async def talos_orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     body = "Current working orders\n" + "\n\n".join(blocks)
     await update.message.chat.send_message(f"<pre>{escape(body)}</pre>", parse_mode="HTML")
+
+@require_auth
+async def talos_summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    minutes = 60
+    verbose = False
+    for arg in (context.args or []):
+        a = str(arg).strip().lower()
+        if not a:
+            continue
+        if a.isdigit():
+            minutes = max(int(a), 1)
+            continue
+        if a in {"verbose", "v", "raw"}:
+            verbose = True
+            continue
+        if a in {"agg", "aggregate", "compact"}:
+            verbose = False
+            continue
+        await update.message.chat.send_message(
+            "Usage: /talos_summary [minutes] [verbose]\n"
+            "Examples:\n"
+            "/talos_summary\n"
+            "/talos_summary 60\n"
+            "/talos_summary 60 verbose"
+        )
+        return
+
+    blocks = get_talos_summary_blocks(window_sec=minutes * 60, anchored_to_hour=False, verbose=verbose)
+    if not blocks:
+        await update.message.chat.send_message("No Talos watcher data is available yet.")
+        return
+
+    for b in blocks:
+        await update.message.chat.send_message(b, parse_mode="Markdown")
