@@ -1,2 +1,6 @@
 .DS_Store
 .env.DS_Store
+__pycache__/
+*.pyc
+.venv/
+bot.log
